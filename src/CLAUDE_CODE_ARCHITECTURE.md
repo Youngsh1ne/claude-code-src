@@ -991,58 +991,164 @@ bridge/
 
 ## 12. 多智能体系统
 
+系统实际上有两套并行机制，需要区分：
+
+- **AgentTool 子智能体**：主智能体在同一进程内派发子任务，子智能体完成后将结果直接返回给主智能体（同步委托）。
+- **Swarm/Team 协调器模式**：一个 Coordinator 智能体通过 `TeamCreateTool` 创建团队，异步派发多个 worker，worker 完成后通过 `<task-notification>` XML 消息回报，Coordinator 可同时管理多个并行 worker。
+
 ### 12.1 AgentTool — 子智能体
 
-AgentTool 是最复杂的工具之一（20 个子模块），支持生成独立的子智能体：
+AgentTool 是最复杂的工具之一，支持生成独立的子智能体：
 
 ```
 AgentTool/
-├── AgentTool.tsx              # 主实现（1400+ 行）
-├── agentToolUtils.ts          # 工具过滤、解析
+├── AgentTool.tsx              # 主实现
+├── agentToolUtils.ts          # 工具过滤、生命周期管理
 ├── agentMemory.ts             # 智能体记忆管理
-├── agentMemorySnapshot.ts     # 记忆快照
-├── agentColorManager.ts       # 颜色管理
+├── agentMemorySnapshot.ts     # 记忆快照（子智能体无主智能体上下文，通过此机制注入）
+├── agentColorManager.ts       # 颜色管理（多智能体 UI 区分）
 ├── agentDisplay.ts            # 显示逻辑
+├── runAgent.ts                # 智能体运行主循环
+├── forkSubagent.ts            # 子智能体 fork 逻辑
+├── resumeAgent.ts             # 恢复已有智能体
+├── prompt.ts                  # 智能体 prompt 构建
+├── builtInAgents.ts           # 内置智能体注册表
+├── loadAgentsDir.ts           # 从目录加载自定义智能体定义
 │
-├── built-in/                  # 内置智能体类型
-│   ├── generalPurposeAgent.ts # 通用智能体
-│   ├── exploreAgent.ts        # 探索智能体（只读）
-│   ├── planAgent.ts           # 规划智能体
-│   └── claudeCodeGuideAgent.ts # Claude Code 指南智能体
+└── built-in/                  # 内置智能体类型
+    ├── generalPurposeAgent.ts # 通用智能体
+    ├── exploreAgent.ts        # 探索智能体（只读）
+    ├── planAgent.ts           # 规划智能体（只读）
+    ├── verificationAgent.ts   # 验证智能体（只读，输出 PASS/FAIL/PARTIAL）
+    └── claudeCodeGuideAgent.ts # Claude Code 指南智能体
 ```
 
 ### 12.2 智能体类型
 
-| 类型 | 说明 | 工具集 |
-|------|------|--------|
-| General Purpose | 通用子智能体 | 完整工具集 |
-| Explore | 探索型（只读） | 只读工具 |
-| Plan | 规划型 | 只读 + 规划工具 |
-| Claude Code Guide | 使用指南 | 只读工具 |
-| Custom | 用户自定义 | 可配置 |
+实际内置了 5 种智能体类型（含文档未提及的 `verification`）：
+
+| 类型 | 模型 | 工具限制 | 特点 |
+|------|------|----------|------|
+| `general-purpose` | 默认子智能体模型 | 全部工具（`*`） | 通用，完整能力，适合复杂多步骤任务 |
+| `Explore` | haiku（外部用户）/ inherit（Anthropic 内部） | 禁用所有写入工具 | 只读，`omitClaudeMd: true` 节省 token，速度优先 |
+| `Plan` | inherit（继承主模型） | 禁用所有写入工具 | 只读，输出含关键文件列表的实现计划 |
+| `verification` | inherit | 禁用所有写入工具 | 专门验证实现正确性，强制要求每个检查项都有实际命令输出 |
+| `claudeCodeGuide` | — | 只读工具 | Claude Code 使用指南 |
+| Custom | 可配置 | 可配置 | 从 `agents/` 目录加载用户自定义定义 |
+
+**`verification` 智能体的特殊设计**：其 system prompt 极其详细，专门对抗两种失效模式——"验证回避"（只读代码不实际运行）和"被前 80% 迷惑"（看到测试通过就放行）。每个检查项必须包含实际执行的命令和输出，否则视为跳过而非通过。
+
+**`Explore` 智能体的模型差异**：Anthropic 内部（`USER_TYPE === 'ant'`）使用 `inherit` 继承主模型，外部用户使用 `haiku` 以提升速度。这说明该系统本身就是 Claude Code 内部开发时使用的工具。
 
 ### 12.3 团队智能体 (Swarm)
 
+Swarm 模式下，Coordinator 负责协调，不直接写代码，通过工具管理 worker 生命周期：
+
 ```typescript
-// TeamCreateTool — 创建团队级并行工作
-// 多个智能体可以同时工作在不同任务上
+// TeamCreateTool — 创建团队，初始化任务列表和团队文件
+// 每个 leader 同一时间只能管理一个团队
+TeamCreateTool({ team_name: "my-team", description: "...", agent_type: "researcher" })
 
-// SendMessageTool — 智能体间通信
-// 智能体可以互相发送消息协调工作
+// AgentTool — 派发 worker（subagent_type: "worker"）
+// 多个 worker 可并行运行在不同任务上
+AgentTool({ description: "Investigate auth bug", subagent_type: "worker", prompt: "..." })
+AgentTool({ description: "Research test coverage", subagent_type: "worker", prompt: "..." })
 
-// coordinator/coordinatorMode.ts — 协调器模式
-// 管理多智能体的生命周期和通信
+// SendMessageTool — 继续已有 worker（复用其上下文）
+// worker 完成后通过 <task-notification> XML 回报，task-id 即为 agent ID
+SendMessageTool({ to: "agent-a1b", message: "Fix the null pointer in src/auth/validate.ts:42..." })
+
+// TaskStopTool — 停止方向错误的 worker
+TaskStopTool({ task_id: "agent-x7q" })
 ```
+
+**Coordinator 工作流**：
+
+```
+用户
+  ↓
+Coordinator（只协调，不写代码）
+  ├── AgentTool → Worker A（研究）  ← 并行派发
+  ├── AgentTool → Worker B（研究）
+  │
+  ← <task-notification> 回报（以 user-role 消息形式到达）
+  │
+  Coordinator 综合结果，写含具体文件路径/行号的 spec
+  │
+  ├── SendMessageTool → Worker A（继续，复用已有上下文）
+  └── AgentTool → Worker C（新任务，干净上下文）
+```
+
+Coordinator 的 system prompt 明确禁止"懒委托"写法（如 `"Based on your findings, fix it"`），必须自己理解 worker 结果后写出具体 spec。
+
+**继续 vs 新建 worker 的选择原则**：
+
+| 情况 | 方式 | 原因 |
+|------|------|------|
+| 研究 worker 探索了恰好需要修改的文件 | `SendMessageTool` 继续 | 已有文件上下文，直接给 spec |
+| 研究范围广但实现范围窄 | `AgentTool` 新建 | 避免带入无关探索噪音 |
+| 纠正失败或扩展近期工作 | `SendMessageTool` 继续 | Worker 有错误上下文 |
+| 验证另一个 worker 刚写的代码 | `AgentTool` 新建 | 验证者应以全新视角审查 |
 
 ### 12.4 智能体工具过滤
 
+`filterToolsForAgent` 的过滤规则按优先级从高到低执行：
+
 ```typescript
-function filterToolsForAgent({ tools, agentType, ... }) {
-  // 根据智能体类型过滤可用工具
-  // explore 智能体只能使用只读工具
-  // plan 智能体不能使用写入工具
-  // 自定义智能体按配置过滤
+function filterToolsForAgent({
+  tools,
+  isBuiltIn,
+  isAsync = false,
+  permissionMode,
+}: {
+  tools: Tools
+  isBuiltIn: boolean
+  isAsync?: boolean
+  permissionMode?: PermissionMode
+}): Tools {
+  return tools.filter(tool => {
+    // 1. MCP 工具全部放行（所有智能体类型均可使用）
+    if (tool.name.startsWith('mcp__')) return true
+
+    // 2. plan 模式下放行 ExitPlanMode（绕过后续所有过滤）
+    if (toolMatchesName(tool, EXIT_PLAN_MODE_V2_TOOL_NAME) && permissionMode === 'plan') return true
+
+    // 3. 全局禁止列表（所有子智能体都不能用）
+    if (ALL_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false
+
+    // 4. 自定义智能体额外禁止列表
+    if (!isBuiltIn && CUSTOM_AGENT_DISALLOWED_TOOLS.has(tool.name)) return false
+
+    // 5. 异步智能体只允许白名单内的工具
+    if (isAsync && !ASYNC_AGENT_ALLOWED_TOOLS.has(tool.name)) {
+      // 特例：Swarm in-process teammate 可以调用 AgentTool（派发同步子智能体）
+      // 和任务协调工具，但不能再派发后台异步智能体（防止无限嵌套）
+      if (isAgentSwarmsEnabled() && isInProcessTeammate()) {
+        if (toolMatchesName(tool, AGENT_TOOL_NAME)) return true
+        if (IN_PROCESS_TEAMMATE_ALLOWED_TOOLS.has(tool.name)) return true
+      }
+      return false
+    }
+
+    return true
+  })
 }
+```
+
+各内置智能体的 `disallowedTools` 配置（在各自定义文件中声明）：
+
+```typescript
+// Explore / Plan / verification 智能体共同禁用的工具
+disallowedTools: [
+  AGENT_TOOL_NAME,        // 不能再派发子智能体
+  EXIT_PLAN_MODE_TOOL_NAME,
+  FILE_EDIT_TOOL_NAME,    // 不能编辑文件
+  FILE_WRITE_TOOL_NAME,   // 不能写入文件
+  NOTEBOOK_EDIT_TOOL_NAME,
+]
+
+// general-purpose 智能体
+tools: ['*']  // 全部工具，不设 disallowedTools
 ```
 
 
